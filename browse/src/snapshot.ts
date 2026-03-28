@@ -17,9 +17,10 @@
  * Later: "click @e3" → look up Locator → locator.click()
  */
 
-import type { Page, Locator } from 'playwright';
-import type { BrowserManager } from './browser-manager';
+import type { Page, Frame, Locator } from 'playwright';
+import type { BrowserManager, RefEntry } from './browser-manager';
 import * as Diff from 'diff';
+import { TEMP_DIR, isPathWithin } from './platform';
 
 // Roles considered "interactive" for the -i flag
 const INTERACTIVE_ROLES = new Set([
@@ -40,6 +41,31 @@ interface SnapshotOptions {
   cursorInteractive?: boolean; // -C / --cursor-interactive: scan cursor:pointer etc.
 }
 
+/**
+ * Snapshot flag metadata — single source of truth for CLI parsing and doc generation.
+ *
+ * Imported by:
+ *   - gen-skill-docs.ts (generates {{SNAPSHOT_FLAGS}} tables)
+ *   - skill-parser.ts (validates flags in SKILL.md examples)
+ */
+export const SNAPSHOT_FLAGS: Array<{
+  short: string;
+  long: string;
+  description: string;
+  takesValue?: boolean;
+  valueHint?: string;
+  optionKey: keyof SnapshotOptions;
+}> = [
+  { short: '-i', long: '--interactive', description: 'Interactive elements only (buttons, links, inputs) with @e refs', optionKey: 'interactive' },
+  { short: '-c', long: '--compact', description: 'Compact (no empty structural nodes)', optionKey: 'compact' },
+  { short: '-d', long: '--depth', description: 'Limit tree depth (0 = root only, default: unlimited)', takesValue: true, valueHint: '<N>', optionKey: 'depth' },
+  { short: '-s', long: '--selector', description: 'Scope to CSS selector', takesValue: true, valueHint: '<sel>', optionKey: 'selector' },
+  { short: '-D', long: '--diff', description: 'Unified diff against previous snapshot (first call stores baseline)', optionKey: 'diff' },
+  { short: '-a', long: '--annotate', description: 'Annotated screenshot with red overlay boxes and ref labels', optionKey: 'annotate' },
+  { short: '-o', long: '--output', description: 'Output path for annotated screenshot (default: <temp>/browse-annotated.png)', takesValue: true, valueHint: '<path>', optionKey: 'outputPath' },
+  { short: '-C', long: '--cursor-interactive', description: 'Cursor-interactive elements (@c refs — divs with pointer, onclick)', optionKey: 'cursorInteractive' },
+];
+
 interface ParsedNode {
   indent: number;
   role: string;
@@ -50,49 +76,24 @@ interface ParsedNode {
 }
 
 /**
- * Parse CLI args into SnapshotOptions
+ * Parse CLI args into SnapshotOptions — driven by SNAPSHOT_FLAGS metadata.
  */
 export function parseSnapshotArgs(args: string[]): SnapshotOptions {
   const opts: SnapshotOptions = {};
   for (let i = 0; i < args.length; i++) {
-    switch (args[i]) {
-      case '-i':
-      case '--interactive':
-        opts.interactive = true;
-        break;
-      case '-c':
-      case '--compact':
-        opts.compact = true;
-        break;
-      case '-d':
-      case '--depth':
-        opts.depth = parseInt(args[++i], 10);
+    const flag = SNAPSHOT_FLAGS.find(f => f.short === args[i] || f.long === args[i]);
+    if (!flag) throw new Error(`Unknown snapshot flag: ${args[i]}`);
+    if (flag.takesValue) {
+      const value = args[++i];
+      if (!value) throw new Error(`Usage: snapshot ${flag.short} <value>`);
+      if (flag.optionKey === 'depth') {
+        (opts as any)[flag.optionKey] = parseInt(value, 10);
         if (isNaN(opts.depth!)) throw new Error('Usage: snapshot -d <number>');
-        break;
-      case '-s':
-      case '--selector':
-        opts.selector = args[++i];
-        if (!opts.selector) throw new Error('Usage: snapshot -s <selector>');
-        break;
-      case '-D':
-      case '--diff':
-        opts.diff = true;
-        break;
-      case '-a':
-      case '--annotate':
-        opts.annotate = true;
-        break;
-      case '-o':
-      case '--output':
-        opts.outputPath = args[++i];
-        if (!opts.outputPath) throw new Error('Usage: snapshot -o <path>');
-        break;
-      case '-C':
-      case '--cursor-interactive':
-        opts.cursorInteractive = true;
-        break;
-      default:
-        throw new Error(`Unknown snapshot flag: ${args[i]}`);
+      } else {
+        (opts as any)[flag.optionKey] = value;
+      }
+    } else {
+      (opts as any)[flag.optionKey] = true;
     }
   }
   return opts;
@@ -135,15 +136,18 @@ export async function handleSnapshot(
 ): Promise<string> {
   const opts = parseSnapshotArgs(args);
   const page = bm.getPage();
+  // Frame-aware target for accessibility tree
+  const target = bm.getActiveFrameOrPage();
+  const inFrame = bm.getFrame() !== null;
 
   // Get accessibility tree via ariaSnapshot
   let rootLocator: Locator;
   if (opts.selector) {
-    rootLocator = page.locator(opts.selector);
+    rootLocator = target.locator(opts.selector);
     const count = await rootLocator.count();
     if (count === 0) throw new Error(`Selector not found: ${opts.selector}`);
   } else {
-    rootLocator = page.locator('body');
+    rootLocator = target.locator('body');
   }
 
   const ariaText = await rootLocator.ariaSnapshot();
@@ -154,7 +158,7 @@ export async function handleSnapshot(
 
   // Parse the ariaSnapshot output
   const lines = ariaText.split('\n');
-  const refMap = new Map<string, Locator>();
+  const refMap = new Map<string, RefEntry>();
   const output: string[] = [];
   let refCounter = 1;
 
@@ -204,11 +208,11 @@ export async function handleSnapshot(
 
     let locator: Locator;
     if (opts.selector) {
-      locator = page.locator(opts.selector).getByRole(node.role as any, {
+      locator = target.locator(opts.selector).getByRole(node.role as any, {
         name: node.name || undefined,
       });
     } else {
-      locator = page.getByRole(node.role as any, {
+      locator = target.getByRole(node.role as any, {
         name: node.name || undefined,
       });
     }
@@ -218,7 +222,7 @@ export async function handleSnapshot(
       locator = locator.nth(seenIndex);
     }
 
-    refMap.set(ref, locator);
+    refMap.set(ref, { locator, role: node.role, name: node.name || '' });
 
     // Format output line
     let outputLine = `${indent}@${ref} [${node.role}]`;
@@ -232,7 +236,7 @@ export async function handleSnapshot(
   // ─── Cursor-interactive scan (-C) ─────────────────────────
   if (opts.cursorInteractive) {
     try {
-      const cursorElements = await page.evaluate(() => {
+      const cursorElements = await target.evaluate(() => {
         const STANDARD_INTERACTIVE = new Set([
           'A', 'BUTTON', 'INPUT', 'SELECT', 'TEXTAREA', 'SUMMARY', 'DETAILS',
         ]);
@@ -286,8 +290,8 @@ export async function handleSnapshot(
         let cRefCounter = 1;
         for (const elem of cursorElements) {
           const ref = `c${cRefCounter++}`;
-          const locator = page.locator(elem.selector);
-          refMap.set(ref, locator);
+          const locator = target.locator(elem.selector);
+          refMap.set(ref, { locator, role: 'cursor-interactive', name: elem.text });
           output.push(`@${ref} [${elem.reason}] "${elem.text}"`);
         }
       }
@@ -308,19 +312,19 @@ export async function handleSnapshot(
 
   // ─── Annotated screenshot (-a) ────────────────────────────
   if (opts.annotate) {
-    const screenshotPath = opts.outputPath || '/tmp/browse-annotated.png';
+    const screenshotPath = opts.outputPath || `${TEMP_DIR}/browse-annotated.png`;
     // Validate output path (consistent with screenshot/pdf/responsive)
     const resolvedPath = require('path').resolve(screenshotPath);
-    const safeDirs = ['/tmp', process.cwd()];
-    if (!safeDirs.some((dir: string) => resolvedPath === dir || resolvedPath.startsWith(dir + '/'))) {
+    const safeDirs = [TEMP_DIR, process.cwd()];
+    if (!safeDirs.some((dir: string) => isPathWithin(resolvedPath, dir))) {
       throw new Error(`Path must be within: ${safeDirs.join(', ')}`);
     }
     try {
       // Inject overlay divs at each ref's bounding box
       const boxes: Array<{ ref: string; box: { x: number; y: number; width: number; height: number } }> = [];
-      for (const [ref, locator] of refMap) {
+      for (const [ref, entry] of refMap) {
         try {
-          const box = await locator.boundingBox({ timeout: 1000 });
+          const box = await entry.locator.boundingBox({ timeout: 1000 });
           if (box) {
             boxes.push({ ref: `@${ref}`, box });
           }
@@ -392,6 +396,12 @@ export async function handleSnapshot(
 
   // Store for future diffs
   bm.setLastSnapshot(snapshotText);
+
+  // Add frame context header when operating inside an iframe
+  if (inFrame) {
+    const frameUrl = bm.getFrame()?.url() ?? 'unknown';
+    output.unshift(`[Context: iframe src="${frameUrl}"]`);
+  }
 
   return output.join('\n');
 }
